@@ -12,6 +12,7 @@ from utils.misc import *
 from utils.data import *
 from models.vae_gaussian import *
 from models.vae_flow import *
+from models.vae_flow_surface import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
 
@@ -37,8 +38,8 @@ parser.add_argument('--spectral_norm', type=eval, default=False, choices=[True, 
 parser.add_argument('--ckpt', type=str, default=None)
 
 # Datasets and loaders
-parser.add_argument('--dataset_path', type=str, default='./data/shapenet.hdf5')
-parser.add_argument('--categories', type=str_list, default=['airplane'])
+parser.add_argument('--dataset_path', type=str, default='./data/pandaset.pkl')
+parser.add_argument('--category', type=str, default='car')
 parser.add_argument('--scale_mode', type=str, default='shape_unit')
 parser.add_argument('--train_batch_size', type=int, default=128)
 parser.add_argument('--val_batch_size', type=int, default=64)
@@ -80,15 +81,15 @@ logger.info(args)
 # Datasets and loaders
 logger.info('Loading datasets...')
 
-train_dset = ShapeNetCore(
+train_dset = PandaSet(
     path=args.dataset_path,
-    cates=args.categories,
+    cls=args.category,
     split='train',
     scale_mode=args.scale_mode,
 )
-val_dset = ShapeNetCore(
+val_dset = PandaSet(
     path=args.dataset_path,
-    cates=args.categories,
+    cls=args.category,
     split='val',
     scale_mode=args.scale_mode,
 )
@@ -103,14 +104,13 @@ logger.info('Building model...')
 if args.model == 'gaussian':
     model = GaussianVAE(args).to(args.device)
 elif args.model == 'flow':
-    model = FlowVAE(args).to(args.device)
+    model = FlowVAESurface(args).to(args.device)
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
 if args.ckpt is not None:
     ckpt = torch.load(args.ckpt)
-    breakpoint()
-    model.load_state_dict(ckpt['state_dict'])
+    model.load_partial_state_dict(ckpt['state_dict'])
 
 # Optimizer and scheduler
 optimizer = torch.optim.Adam(model.parameters(), 
@@ -129,7 +129,9 @@ scheduler = get_linear_scheduler(
 def train(it):
     # Load data
     batch = next(train_iter)
-    x = batch['pointcloud'].to(args.device)
+    x = batch['pointcloud'].float().to(args.device)
+    view_angle = batch['view_angle'].float().to(args.device)
+    yaw = batch['yaw'].float().to(args.device)
 
     # Reset grad and model state
     optimizer.zero_grad()
@@ -139,7 +141,7 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+    loss = model.get_loss(x, view_angle, yaw, kl_weight=kl_weight, writer=writer, it=it)
 
     # Backward and optimize
     loss.backward()

@@ -1,0 +1,13 @@
+.bash_history
+
+.cache
+
+.local
+
+.python_history
+
+*.pth
+
+*.bin
+
+results/*
