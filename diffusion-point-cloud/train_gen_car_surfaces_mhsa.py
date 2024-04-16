@@ -3,6 +3,7 @@ import math
 import argparse
 import torch
 import torch.utils.tensorboard
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
@@ -12,7 +13,7 @@ from utils.misc import *
 from utils.data import *
 from models.vae_gaussian import *
 from models.vae_flow import *
-from models.vae_flow_surface import *
+from models.vae_flow_surface_mhsa import *
 from models.flow import add_spectral_norm, spectral_norm_power_iteration
 from evaluation import *
 
@@ -48,7 +49,7 @@ parser.add_argument('--val_batch_size', type=int, default=64)
 parser.add_argument('--lr', type=float, default=1e-4)
 parser.add_argument('--weight_decay', type=float, default=0)
 parser.add_argument('--max_grad_norm', type=float, default=10)
-parser.add_argument('--end_lr', type=float, default=1e-4)
+parser.add_argument('--end_lr', type=float, default=3e-5)
 parser.add_argument('--sched_start_epoch', type=int, default=200*THOUSAND)
 parser.add_argument('--sched_end_epoch', type=int, default=400*THOUSAND)
 
@@ -57,13 +58,21 @@ parser.add_argument('--seed', type=int, default=2020)
 parser.add_argument('--logging', type=eval, default=True, choices=[True, False])
 parser.add_argument('--log_root', type=str, default='./logs_gen')
 parser.add_argument('--device', type=str, default='cuda')
-parser.add_argument('--max_iters', type=int, default=600000)
+parser.add_argument('--max_iters', type=int, default=2000000)
 parser.add_argument('--val_freq', type=int, default=1000)
 parser.add_argument('--test_freq', type=int, default=30*THOUSAND)
 parser.add_argument('--test_size', type=int, default=400)
 parser.add_argument('--tag', type=str, default=None)
 args = parser.parse_args()
 seed_all(args.seed)
+
+if args.device == 'cuda':
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count()
+    print(f"Using {num_gpus} GPUs!")
+else:
+    device = torch.device("cpu")
+    num_gpus = 1
 
 # Logging
 if args.logging:
@@ -104,13 +113,16 @@ logger.info('Building model...')
 if args.model == 'gaussian':
     model = GaussianVAE(args).to(args.device)
 elif args.model == 'flow':
-    model = FlowVAESurface(args).to(args.device)
+    model = FlowVAESurfaceConditional(args).to(args.device)
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
+
+if num_gpus > 1:
+    model = nn.DataParallel(model)
 if args.ckpt is not None:
     ckpt = torch.load(args.ckpt)
-    model.load_partial_state_dict(ckpt['state_dict'])
+    model.load_state_dict(ckpt['state_dict'])
 
 # Optimizer and scheduler
 optimizer = torch.optim.Adam(model.parameters(), 
@@ -141,16 +153,17 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    loss = model.get_loss(x, view_angle, yaw, kl_weight=kl_weight, writer=writer, it=it)
+    loss = model(x, view_angle, yaw, kl_weight=kl_weight, writer=writer, it=it)
 
     # Backward and optimize
+    loss = loss.mean()
     loss.backward()
     orig_grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
     optimizer.step()
     scheduler.step()
 
-    logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f' % (
-        it, loss.item(), orig_grad_norm, kl_weight
+    logger.info('[Train] Iter %04d | Loss %.6f | Grad %.4f | KLWeight %.4f | LR %.4f' % (
+        it, loss.item(), orig_grad_norm, kl_weight, optimizer.param_groups[0]['lr']
     ))
     writer.add_scalar('train/loss', loss, it)
     writer.add_scalar('train/kl_weight', kl_weight, it)
@@ -167,17 +180,29 @@ def validate_inspect(it):
 
 def test(it):
     ref_pcs = []
+    ref_yaw_angle = []
+    ref_view_angle = []
     for i, data in enumerate(val_dset):
         if i >= args.test_size:
             break
         ref_pcs.append(data['pointcloud'].unsqueeze(0))
+        ref_yaw_angle.append(data['yaw'].unsqueeze(0))
+        ref_view_angle.append(data['view_angle'].unsqueeze(0))
+        
+        # # Random yaw and view angle from -pi to pi (TO TEST THE ROBUSTNESS OF THE CONDITIONING)
+        # ref_yaw_angle.append((torch.rand(1) * 2 * math.pi - math.pi).unsqueeze(0))
+        # ref_view_angle.append((torch.rand(1) * 2 * math.pi - math.pi).unsqueeze(0))
+
     ref_pcs = torch.cat(ref_pcs, dim=0)
+    ref_yaw_angle = torch.cat(ref_yaw_angle, dim=0).float().to(args.device)
+    ref_view_angle = torch.cat(ref_view_angle, dim=0).float().to(args.device)
 
     gen_pcs = []
     for i in tqdm(range(0, math.ceil(args.test_size / args.val_batch_size)), 'Generate'):
         with torch.no_grad():
-            z = torch.randn([args.val_batch_size, args.latent_dim]).to(args.device)
-            x = model.sample(z, args.sample_num_points, flexibility=args.flexibility)
+            test_indices = list(range(i*args.val_batch_size, min((i+1)*args.val_batch_size, args.test_size)))
+            z = torch.randn([len(test_indices), args.latent_dim]).to(args.device)
+            x = model.sample(z, ref_view_angle[test_indices], ref_yaw_angle[test_indices], args.sample_num_points, flexibility=args.flexibility)
             gen_pcs.append(x.detach().cpu())
     gen_pcs = torch.cat(gen_pcs, dim=0)[:args.test_size]
 
@@ -187,7 +212,7 @@ def test(it):
     # gen_pcs *= val_dset.stats['std']
 
     with torch.no_grad():
-        results = compute_all_metrics(gen_pcs.to(args.device), ref_pcs.to(args.device), args.val_batch_size)
+        results = compute_all_metrics(gen_pcs.float().to(args.device), ref_pcs.float().to(args.device), args.val_batch_size)
         results = {k:v.item() for k, v in results.items()}
         jsd = jsd_between_point_cloud_sets(gen_pcs.cpu().numpy(), ref_pcs.cpu().numpy())
         results['jsd'] = jsd
@@ -218,7 +243,7 @@ try:
     while it <= args.max_iters:
         train(it)
         if it % args.val_freq == 0 or it == args.max_iters:
-            validate_inspect(it)
+            # validate_inspect(it)
             opt_states = {
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),

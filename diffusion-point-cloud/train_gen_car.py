@@ -38,7 +38,7 @@ parser.add_argument('--ckpt', type=str, default=None)
 
 # Datasets and loaders
 parser.add_argument('--dataset_path', type=str, default='./data/shapenet.hdf5')
-parser.add_argument('--categories', type=str_list, default=['airplane'])
+parser.add_argument('--categories', type=str_list, default=['car'])
 parser.add_argument('--scale_mode', type=str, default='shape_unit')
 parser.add_argument('--train_batch_size', type=int, default=128)
 parser.add_argument('--val_batch_size', type=int, default=64)
@@ -63,6 +63,15 @@ parser.add_argument('--test_size', type=int, default=400)
 parser.add_argument('--tag', type=str, default=None)
 args = parser.parse_args()
 seed_all(args.seed)
+
+if args.device == 'cuda':
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    num_gpus = torch.cuda.device_count()
+    print(f"Using {num_gpus} GPUs!")
+else:
+    device = torch.device("cpu")
+    num_gpus = 1
+
 
 # Logging
 if args.logging:
@@ -107,6 +116,8 @@ elif args.model == 'flow':
 logger.info(repr(model))
 if args.spectral_norm:
     add_spectral_norm(model, logger=logger)
+if num_gpus > 1:
+    model = nn.DataParallel(model)
 if args.ckpt is not None:
     ckpt = torch.load(args.ckpt)
     model.load_state_dict(ckpt['state_dict'])
@@ -138,10 +149,12 @@ def train(it):
 
     # Forward
     kl_weight = args.kl_weight
-    loss = model.get_loss(x, kl_weight=kl_weight, writer=writer, it=it)
+    loss = model(x, kl_weight=kl_weight, writer=writer, it=it)
 
     # Backward and optimize
+    loss = loss.mean()
     loss.backward()
+
     orig_grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
     optimizer.step()
     scheduler.step()
@@ -157,7 +170,7 @@ def train(it):
 
 def validate_inspect(it):
     z = torch.randn([args.num_samples, args.latent_dim]).to(args.device)
-    x = model.sample(z, args.sample_num_points, flexibility=args.flexibility) #, truncate_std=args.truncate_std)
+    x = model.module.sample(z, args.sample_num_points, flexibility=args.flexibility) #, truncate_std=args.truncate_std)
     writer.add_mesh('val/pointcloud', x, global_step=it)
     writer.flush()
     logger.info('[Inspect] Generating samples...')
@@ -174,7 +187,7 @@ def test(it):
     for i in tqdm(range(0, math.ceil(args.test_size / args.val_batch_size)), 'Generate'):
         with torch.no_grad():
             z = torch.randn([args.val_batch_size, args.latent_dim]).to(args.device)
-            x = model.sample(z, args.sample_num_points, flexibility=args.flexibility)
+            x = model.module.sample(z, args.sample_num_points, flexibility=args.flexibility)
             gen_pcs.append(x.detach().cpu())
     gen_pcs = torch.cat(gen_pcs, dim=0)[:args.test_size]
 

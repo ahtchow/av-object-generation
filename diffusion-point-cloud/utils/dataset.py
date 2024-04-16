@@ -186,24 +186,43 @@ class PandaSet(Dataset):
         os.makedirs(stats_dir, exist_ok=True)
 
         stats_save_path = os.path.join(stats_dir, 'stats_' + '_'.join(self.cls) + '.pt')
-        if os.path.exists(stats_save_path):
-            self.stats = torch.load(stats_save_path)
-            return self.stats
 
         with open(self.path, 'rb') as f:
             data = pkl.load(f)
             pointclouds = []
+            rel_distance = []
             for split in ('train', 'val', 'test'):
                 for obj in data[self.cls][split]:
+                    rel_distance.append(torch.norm(torch.from_numpy(obj['points'])- torch.Tensor(obj['box']['position']), dim=1).reshape(-1, 1))
                     pointclouds.append(self.normalize_point_cloud(torch.from_numpy(obj['points'])))
 
         all_points = torch.cat(pointclouds, dim=0) # (B, N, 3)
+        rel_distance = torch.cat(rel_distance, dim=0)
         N, _ = all_points.size()
         mean = all_points.mean(dim=0) # (1, 3)
         std = all_points.view(-1).std(dim=0)   # (1, )
-        self.stats = {'mean': mean, 'std': std}
+        self.stats = {'mean': mean, 'std': std, 'mean_dist_from_center': rel_distance.mean(), 'std_dist_from_center': rel_distance.std()}
         torch.save(self.stats, stats_save_path)
         return self.stats
+
+    def get_features_from_pc(self, obj):
+        # pc: (N, 3)
+        pc = torch.from_numpy(obj['points'])
+        pos = torch.Tensor(obj['box']['position'])
+        rel_pc = pc - pos
+
+        # # Compute point cloud as relative to the object center in spherical coordinates
+        r = torch.norm(rel_pc, dim=1).reshape(-1, 1) # (N, 1)
+        theta = torch.atan2(rel_pc[:, 1], rel_pc[:, 0]).reshape(-1, 1) # (N, 1)
+        phi = torch.acos(rel_pc[:, 2] / r.flatten()).reshape(-1, 1) # (N, 1)
+
+        # Normalize
+        r = (r - self.stats['mean_dist_from_center']) / self.stats['std_dist_from_center']
+        theta = (theta) / (np.pi/2)
+        phi = (phi) / np.pi
+        breakpoint()
+
+        return torch.cat([r, theta, phi], dim=1)
 
     def load(self):
 
@@ -212,8 +231,12 @@ class PandaSet(Dataset):
   
         for pc_id, obj in enumerate(data[self.cls][self.split]):
             
-            pc = torch.from_numpy(obj['points'])
+            # pc = self.get_features_from_pc(obj)
 
+            pc = torch.from_numpy(obj['points'])
+            pos = torch.Tensor(obj['box']['position'])
+            pc = pc - pos
+                
             if self.scale_mode == 'global_unit':
                 shift = pc.mean(dim=0).reshape(1, 3)
                 scale = self.stats['std'].reshape(1, 1)
@@ -236,15 +259,22 @@ class PandaSet(Dataset):
                 scale = torch.ones([1, 1])
 
             pc = (pc - shift) / scale
+            yaw = (torch.Tensor([obj['box']['yaw']]) - np.pi/2)
+
+            #normalize yaw between -pi and pi
+            def normalize_angle(angle):
+                # Normalize angle to be within the range [-pi, pi]
+                normalized_angle = (angle + np.pi) % (2 * np.pi) - np.pi
+                return normalized_angle
 
             self.pointclouds.append({
                 'pointcloud': pc,
-                'view_angle': torch.Tensor([obj['box']['view_angle']]),
-                'yaw': torch.Tensor([obj['box']['yaw']]),
+                'view_angle': torch.Tensor([obj['box']['view_angle']]) / np.pi,
+                'yaw': normalize_angle(yaw) / np.pi,
                 'cate': self.cls,
                 'id': pc_id,
-                'shift': shift,
-                'scale': scale
+                'shift': self.stats['mean_dist_from_center'],
+                'scale': self.stats['std_dist_from_center']
             })
 
         # Deterministically shuffle the dataset

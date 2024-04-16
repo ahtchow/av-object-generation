@@ -24,6 +24,9 @@ class FlowVAE(Module):
             )
         )
 
+    def forward(self, x, kl_weight, writer=None, it=None):
+        return self.get_loss(x, kl_weight, writer=writer, it=it)
+
     def get_loss(self, x, kl_weight, writer=None, it=None):
         """
         Args:
